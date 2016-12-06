@@ -1,0 +1,9 @@
+timezone: UTC
+
++run:
+  redshift_load>: ${dest_table}
+  host: ${redshift_host}
+  database: ${redshift_database}
+  user: ${redshift_user}
+  source: ${source_uri}
+  format: csv

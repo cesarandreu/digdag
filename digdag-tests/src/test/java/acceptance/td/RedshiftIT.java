@@ -1,5 +1,8 @@
 package acceptance.td;
 
+import com.amazonaws.auth.AWSCredentials;
+import com.amazonaws.auth.BasicAWSCredentials;
+import com.amazonaws.services.s3.AmazonS3Client;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Optional;
 import com.google.common.collect.ImmutableMap;
@@ -15,9 +18,9 @@ import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import utils.TemporaryDigdagServer;
 import utils.TestUtils;
 
+import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
@@ -45,9 +48,12 @@ public class RedshiftIT
     private String redshiftDatabase;
     private String redshiftUser;
     private String redshiftPassword;
+    private String s3Bucket;
+    private String s3ParentKey;
     private String database;
     private String restrictedUserPassword;
     private Path configFile;
+    private AmazonS3Client s3Client;
 
     @Before
     public void setUp() throws Exception {
@@ -59,13 +65,24 @@ public class RedshiftIT
         redshiftDatabase = config.get("database", String.class);
         redshiftUser = config.get("user", String.class);
         redshiftPassword = config.get("password", String.class);
+        s3Bucket = config.get("s3_bucket", String.class);
+
+        String s3AccessKeyId = config.get("s3_access_key_id", String.class);
+        String s3SecretAccessKey = config.get("s3_secret_access_key", String.class);
+        AWSCredentials credentials = new BasicAWSCredentials(s3AccessKeyId, s3SecretAccessKey);
+        s3Client = new AmazonS3Client(credentials);
+        s3ParentKey = UUID.randomUUID().toString();
 
         database = "redshiftoptest_" + UUID.randomUUID().toString().replace('-', '_');
         restrictedUserPassword = UUID.randomUUID() + "0aZ";
 
         projectDir = folder.getRoot().toPath().toAbsolutePath().normalize();
         configFile = folder.newFile().toPath();
-        Files.write(configFile, asList("secrets.redshift.password= " + redshiftPassword));
+        Files.write(configFile, asList(
+                "secrets.aws.redshift.password= " + redshiftPassword,
+                "secrets.aws.redshift_load.access-key-id=" + s3AccessKeyId,
+                "secrets.aws.secret-access-key=" + s3SecretAccessKey
+        ));
 
         createTempDatabase();
 
@@ -272,12 +289,87 @@ public class RedshiftIT
             conn.executeUpdate("DROP DATABASE " + database);
         }
     }
+
     private void removeRestrictedUser()
     {
         SecretProvider secrets = getAdminDatabaseSecrets();
 
         try (RedshiftConnection conn = RedshiftConnection.open(RedshiftConnectionConfig.configure(secrets, EMPTY_CONFIG))) {
             conn.executeUpdate("DROP USER IF EXISTS " + RESTRICTED_USER);
+        }
+    }
+
+    @FunctionalInterface
+    interface ContentBuilder<T>
+    {
+        void build(T t) throws IOException;
+    }
+
+    @FunctionalInterface
+    interface DigdagRunner
+    {
+        void run() throws IOException;
+    }
+
+    @Test
+    public void loadCSVFileFromS3()
+            throws Exception
+    {
+        loadFromS3AndAssert("testdata0.csv",
+                (w) -> {
+                    w.write("0,foo,3.14");
+                    w.newLine();
+                    w.write("1,bar,1.23");
+                    w.newLine();
+                    w.write("2,baz,5.0");
+                    w.newLine();
+                },
+                () -> {
+                    copyResource("acceptance/redshift/load_from_s3_csv.dig", projectDir.resolve("redshift.dig"));
+                    setupDestTable();
+                    TestUtils.main("run", "-o", projectDir.toString(), "--project", projectDir.toString(),
+                            "-p", "redshift_database=" + database,
+                            "-p", "redshift_host=" + redshiftHost,
+                            "-p", "redshift_user=" + redshiftUser,
+                            "-p", "dest_table=" + DEST_TABLE,
+                            "-p", "source_uri=" + String.format("s3://%s/%s", s3Bucket, s3ParentKey),
+                            "-c", configFile.toString(),
+                            "redshift.dig");
+                },
+                Arrays.asList(
+                        ImmutableMap.of("id", 0, "name", "foo", "score", 3.14f),
+                        ImmutableMap.of("id", 1, "name", "bar", "score", 1.23f),
+                        ImmutableMap.of("id", 2, "name", "baz", "score", 5.0f),
+                        ImmutableMap.of("id", 9, "name", "zzz", "score", 9.99f)
+                )
+        );
+    }
+
+    private void loadFromS3AndAssert(String filename,
+            ContentBuilder<BufferedWriter> contentBuilder,
+            DigdagRunner runner,
+            List<Map<String, Object>> expected)
+            throws Exception
+    {
+        s3Client.createBucket(s3Bucket);
+        TemporaryFolder temporaryFolder = new TemporaryFolder();
+        temporaryFolder.create();
+        temporaryFolder.getRoot().deleteOnExit();
+        File tmpFile = temporaryFolder.newFile();
+        tmpFile.deleteOnExit();
+        String key = s3ParentKey + "/" + filename;
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(tmpFile))) {
+            contentBuilder.build(writer);
+            writer.flush();
+
+            s3Client.putObject(s3Bucket, key, tmpFile);
+
+            runner.run();
+
+            assertTableContents(DEST_TABLE, expected);
+        }
+        finally {
+            s3Client.deleteObject(s3Bucket, key);
         }
     }
 }

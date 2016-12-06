@@ -2,6 +2,7 @@ package io.digdag.standards.operator.redshift;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Optional;
+import com.google.common.collect.ImmutableList;
 import com.google.inject.Inject;
 import io.digdag.client.config.Config;
 import io.digdag.client.config.ConfigElement;
@@ -79,6 +80,35 @@ public class RedshiftLoadOperatorFactory
             return OPERATOR_TYPE;
         }
 
+        @Override
+        protected boolean strictTransaction(Config params)
+        {
+            // TODO: DRY
+            if (params.getOptional("strict_transaction", Boolean.class).isPresent()) {
+                // RedShift doesn't support "SELECT FOR UPDATE" statement
+                logger.warn("'strict_transaction' is ignored in 'redshift' operator");
+            }
+            return false;
+        }
+
+        @Override
+        public List<String> secretSelectors()
+        {
+            return ImmutableList.of("aws.*");
+        }
+
+        @Override
+        protected SecretProvider getSecretsForConnectionConfig(TaskExecutionContext ctx)
+        {
+            return ctx.secrets().getSecrets("aws.redshift");
+        }
+
+        static private String escapeParam(String param)
+        {
+            // TODO: Implement!
+            return param;
+        }
+
         @VisibleForTesting
         static Map.Entry<String, List<Object>> createCopyStatement(Config params, SecretProvider secretProvider)
         {
@@ -123,47 +153,50 @@ public class RedshiftLoadOperatorFactory
             SecretProvider redshiftLoadSecrets = awsSecrets.getSecrets("redshift_load");
 
             String keyOfAccess = "access-key-id";
-            java.util.Optional<Optional<String>> optAccessKey =
+            Optional<String> optAccessKey =
                     Stream.of(
                             redshiftLoadSecrets.getSecretOptional(keyOfAccess),
                             redshiftSecrets.getSecretOptional(keyOfAccess),
                             awsSecrets.getSecretOptional(keyOfAccess))
-                            .findFirst();
+                            .reduce(Optional.absent(), Optional::or);
             if (!optAccessKey.isPresent()) {
                 throw new ConfigException(String.format("'%s' secrets doesn't exist", keyOfAccess));
             }
-            String accessKey = optAccessKey.get().get();
+            String accessKey = optAccessKey.get();
 
             String keyOfSecret = "secret-access-key";
-            java.util.Optional<Optional<String>> optSecretKey =
+            Optional<String> optSecretKey =
                     Stream.of(
                             redshiftLoadSecrets.getSecretOptional(keyOfSecret),
                             redshiftSecrets.getSecretOptional(keyOfSecret),
                             awsSecrets.getSecretOptional(keyOfSecret))
-                    .findFirst();
+                            .reduce(Optional.absent(), Optional::or);
             if (!optSecretKey.isPresent()) {
                 throw new ConfigException(String.format("'%s' secrets doesn't exist", keyOfSecret));
             }
-            String secretKey = optSecretKey.get().get();
+            String secretKey = optSecretKey.get();
 
             List<Object> paramsInSql = new ArrayList<>();
             StringBuilder sb = new StringBuilder();
             // main
-            sb.append("COPY ? FROM '?'\n");
-            paramsInSql.add(destTable);
-            paramsInSql.add(sourceUri);
+            sb.append(
+                    String.format("COPY %s FROM '%s'\n",
+                            escapeParam(destTable),
+                            escapeParam(sourceUri)));
             // credentials
             // TODO: Support ENCRYPTED
-            sb.append("CREDENTIALS 'aws_access_key_id=?;aws_secret_access_key=?'\n");
-            paramsInSql.add(accessKey);
-            paramsInSql.add(secretKey);
+            sb.append(
+                    String.format("CREDENTIALS '%s'\n",
+                            escapeParam(
+                                String.format("aws_access_key_id=%s;aws_secret_access_key=%s",
+                                        accessKey,
+                                        secretKey))));
             // manifests
             if (manifest.or(false)) {
                 sb.append("MANIFEST\n");
             }
             // format
-            sb.append("?");
-            paramsInSql.add(format);
+            sb.append(escapeParam(format));
             switch (format.toUpperCase()) {
                 case "CSV":
                     if (quoteChar.isPresent()) {

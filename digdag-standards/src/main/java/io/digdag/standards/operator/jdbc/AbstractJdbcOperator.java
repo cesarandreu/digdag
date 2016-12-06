@@ -39,17 +39,16 @@ public abstract class AbstractJdbcOperator<C>
     protected abstract TaskResult run(TaskExecutionContext ctx, Config params, Config state, C connectionConfig);
 
     @Override
-    public List<String> secretSelectors()
-    {
-        return ImmutableList.of(type() + ".*");
-    }
+    public abstract List<String> secretSelectors();
+
+    protected abstract SecretProvider getSecretsForConnectionConfig(TaskExecutionContext ctx);
 
     @Override
     public TaskResult runTask(TaskExecutionContext ctx)
     {
         Config params = request.getConfig().mergeDefault(request.getConfig().getNestedOrGetEmpty(type()));
         Config state = request.getLastStateParams().deepCopy();
-        C connectionConfig = configure(ctx.secrets().getSecrets(type()), params);
+        C connectionConfig = configure(getSecretsForConnectionConfig(ctx), params);
         return run(ctx, params, state, connectionConfig);
     }
 }

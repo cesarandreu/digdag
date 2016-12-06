@@ -1,6 +1,7 @@
 package io.digdag.standards.operator.jdbc;
 
 import com.google.common.base.Optional;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import io.digdag.client.config.Config;
 import io.digdag.spi.SecretProvider;
@@ -21,6 +22,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.Consumer;
@@ -102,6 +104,18 @@ public class AbstractJdbcJobOperatorTest
         protected String type()
         {
             return "testop";
+        }
+
+        @Override
+        public List<String> secretSelectors()
+        {
+            return ImmutableList.of("test.*");
+        }
+
+        @Override
+        protected SecretProvider getSecretsForConnectionConfig(TaskExecutionContext ctx)
+        {
+            return ctx.secrets().getSecrets("test");
         }
     }
 

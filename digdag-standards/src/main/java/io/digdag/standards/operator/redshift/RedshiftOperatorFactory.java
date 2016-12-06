@@ -1,10 +1,12 @@
 package io.digdag.standards.operator.redshift;
 
+import com.google.common.collect.ImmutableList;
 import com.google.inject.Inject;
 import io.digdag.client.config.Config;
 import io.digdag.spi.Operator;
 import io.digdag.spi.OperatorFactory;
 import io.digdag.spi.SecretProvider;
+import io.digdag.spi.TaskExecutionContext;
 import io.digdag.spi.TaskRequest;
 import io.digdag.spi.TemplateEngine;
 import io.digdag.standards.operator.jdbc.AbstractJdbcJobOperator;
@@ -12,6 +14,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
+import java.util.List;
 
 public class RedshiftOperatorFactory
         implements OperatorFactory
@@ -72,6 +75,18 @@ public class RedshiftOperatorFactory
                 logger.warn("'strict_transaction' is ignored in 'redshift' operator");
             }
             return false;
+        }
+
+        @Override
+        public List<String> secretSelectors()
+        {
+            return ImmutableList.of("aws.*");
+        }
+
+        @Override
+        protected SecretProvider getSecretsForConnectionConfig(TaskExecutionContext ctx)
+        {
+            return ctx.secrets().getSecrets("aws.readshift");
         }
     }
 }
