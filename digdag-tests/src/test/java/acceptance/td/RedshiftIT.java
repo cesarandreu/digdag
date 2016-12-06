@@ -37,7 +37,6 @@ public class RedshiftIT
 
     private static final Config EMPTY_CONFIG = configFactory().create();
 
-    private TemporaryDigdagServer server;
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
     private Path projectDir;
@@ -87,11 +86,6 @@ public class RedshiftIT
             finally {
                 removeRestrictedUser();
             }
-        }
-
-        if (server != null) {
-            server.close();
-            server = null;
         }
     }
 
