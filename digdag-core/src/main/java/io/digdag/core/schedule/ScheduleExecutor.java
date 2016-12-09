@@ -23,14 +23,18 @@ import io.digdag.core.repository.ResourceConflictException;
 import io.digdag.core.repository.ResourceLimitExceededException;
 import io.digdag.core.repository.ResourceNotFoundException;
 import io.digdag.core.repository.StoredWorkflowDefinitionWithProject;
+import io.digdag.core.workflow.AttemptBuilder;
 import io.digdag.core.workflow.AttemptLimitExceededException;
+import io.digdag.core.workflow.AttemptRequest;
 import io.digdag.core.workflow.SessionAttemptConflictException;
+import io.digdag.core.workflow.WorkflowExecutor;
 import io.digdag.core.session.Session;
 import io.digdag.core.session.AttemptStateFlags;
 import io.digdag.core.session.SessionStore;
 import io.digdag.core.session.SessionStoreManager;
 import io.digdag.core.session.StoredSessionAttemptWithSession;
 import io.digdag.core.session.ImmutableStoredSessionAttempt;
+import io.digdag.client.config.ConfigFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import static java.util.Locale.ENGLISH;
@@ -43,8 +47,10 @@ public class ScheduleExecutor
     private final ProjectStoreManager rm;
     private final ScheduleStoreManager sm;
     private final SchedulerManager srm;
-    private final ScheduleHandler handler;
     private final SessionStoreManager sessionStoreManager;  // used for validation in backfill method
+    private final AttemptBuilder attemptBuilder;
+    private final WorkflowExecutor workflowExecutor;
+    private final ConfigFactory cf;
     private ScheduledExecutorService executor;
 
     @Inject(optional = true)
@@ -55,14 +61,18 @@ public class ScheduleExecutor
             ProjectStoreManager rm,
             ScheduleStoreManager sm,
             SchedulerManager srm,
-            ScheduleHandler handler,
-            SessionStoreManager sessionStoreManager)
+            SessionStoreManager sessionStoreManager,
+            AttemptBuilder attemptBuilder,
+            WorkflowExecutor workflowExecutor,
+            ConfigFactory cf)
     {
         this.rm = rm;
         this.sm = sm;
         this.srm = srm;
-        this.handler = handler;
         this.sessionStoreManager = sessionStoreManager;
+        this.attemptBuilder = attemptBuilder;
+        this.workflowExecutor = workflowExecutor;
+        this.cf = cf;
     }
 
     @PostConstruct
@@ -174,9 +184,7 @@ public class ScheduleExecutor
         Instant runTime = sched.getNextRunTime();
 
         try {
-            handler.start(def,
-                    ScheduleTime.of(scheduleTime, runTime),
-                    Optional.absent());
+            submitWorkflow(def, ScheduleTime.of(scheduleTime, runTime), Optional.absent());
         }
         catch (SessionAttemptConflictException ex) {
             logger.debug("Scheduled attempt {} is already executed. Skipping", ex.getConflictedSession());
@@ -311,41 +319,65 @@ public class ScheduleExecutor
             }
 
             // run sessions
-            ImmutableList.Builder<StoredSessionAttemptWithSession> attempts = ImmutableList.builder();
-            for (Instant instant : instants) {
-                if (dryRun) {
-                    attempts.add(
-                            StoredSessionAttemptWithSession.dryRunDummy(siteId,
-                                Session.of(def.getProject().getId(), def.getName(), instant),
-                                ImmutableStoredSessionAttempt.builder()
-                                    .retryAttemptName(Optional.of(attemptName))
-                                    .workflowDefinitionId(Optional.of(def.getId()))
-                                    .timeZone(def.getTimeZone())
-                                    .id(0L)
-                                    .params(def.getConfig().getFactory().create())
-                                    .stateFlags(AttemptStateFlags.empty())
-                                    .sessionId(0L)
-                                    .createdAt(Instant.now())
-                                    .finishedAt(Optional.absent())
-                                    .build()
-                            )
-                        );
-                }
-                else {
-                    try {
-                        StoredSessionAttemptWithSession attempt = handler.start(def,
-                                ScheduleTime.of(instant, sched.getNextScheduleTime()),
+            return workflowExecutor.submitTransaction(siteId, (submitter) -> {
+                ImmutableList.Builder<StoredSessionAttemptWithSession> attempts = ImmutableList.builder();
+
+                Optional<Long> lastSessionId = Optional.absent();
+
+                for (Instant instant : instants) {
+                    if (dryRun) {
+                        attempts.add(
+                                StoredSessionAttemptWithSession.dryRunDummy(siteId,
+                                    Session.of(def.getProject().getId(), def.getName(), instant),
+                                    ImmutableStoredSessionAttempt.builder()
+                                        .retryAttemptName(Optional.of(attemptName))
+                                        .workflowDefinitionId(Optional.of(def.getId()))
+                                        .timeZone(def.getTimeZone())
+                                        .id(0L)
+                                        .params(def.getConfig().getFactory().create())
+                                        .stateFlags(AttemptStateFlags.empty())
+                                        .sessionId(0L)
+                                        .createdAt(Instant.now())
+                                        .finishedAt(Optional.absent())
+                                        .build()
+                                )
+                            );
+                    }
+                    else {
+                        AttemptRequest ar = newAttemptrequest(
+                                def, ScheduleTime.of(instant, sched.getNextScheduleTime()),
                                 Optional.of(attemptName));
+                        StoredSessionAttemptWithSession attempt = submitter.submitDelayedAttempt(ar, lastSessionId);
+                        lastSessionId = Optional.of(attempt.getId());
                         attempts.add(attempt);
-                        // TODO this may throw ResourceLimitExceededException. But some sessions are already committed. To be able to rollback everything, inserting all sessions needs to be in a single transaction.
-                    }
-                    catch (SessionAttemptConflictException ex) {
-                        // ignore because above start already committed other attempts. here can't rollback.
-                        logger.warn("Session attempt conflicted after validation", ex);
                     }
                 }
-            }
-            return attempts.build();
+
+                return attempts.build();
+            });
         });
+    }
+
+    private AttemptRequest newAttemptrequest(
+            StoredWorkflowDefinitionWithProject def,
+            ScheduleTime time, Optional<String> retryAttemptName)
+    {
+        return attemptBuilder.buildFromStoredWorkflow(
+                def,
+                cf.create(),
+                time,
+                retryAttemptName,
+                Optional.absent(),
+                ImmutableList.of());
+    }
+
+
+    public StoredSessionAttemptWithSession submitWorkflow(StoredWorkflowDefinitionWithProject def,
+            ScheduleTime time, Optional<String> retryAttemptName)
+            throws ResourceNotFoundException, ResourceLimitExceededException, SessionAttemptConflictException
+    {
+        AttemptRequest ar = newAttemptrequest(def, time, retryAttemptName);
+        return workflowExecutor.submitWorkflow(def.getProject().getSiteId(),
+                ar, def);
     }
 }
