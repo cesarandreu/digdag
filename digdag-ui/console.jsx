@@ -4,17 +4,21 @@ import './style.less'
 import 'babel-polyfill'
 import 'whatwg-fetch'
 
+import 'bootstrap/dist/js/bootstrap'
+
 import _ from 'lodash'
 
 import React from 'react'
 import { Router, Link, Route, browserHistory, withRouter } from 'react-router'
 import Measure from 'react-measure'
 import moment from 'moment'
+import 'moment-duration-format'
 import pako from 'pako'
 import path from 'path'
 import yaml from 'js-yaml'
 import Duration from 'duration'
 import uuid from 'node-uuid'
+import jQuery from 'jquery'
 
 // noinspection ES6UnusedImports
 import { TD_LOAD_VALUE_TOKEN, TD_RUN_VALUE_TOKEN } from './ace-digdag'
@@ -1226,6 +1230,79 @@ const TaskListView = (props:{tasks: Array<Task>}) =>
     </table>
   </div>
 
+class TaskTimelineRow extends React.Component {
+
+  props:{
+    task: Task;
+    startTime: ?Object;
+    endTime: ?Object;
+  };
+
+  componentDidMount () {
+    jQuery(this.progressBar).tooltip()
+  }
+
+  render () {
+    const { startTime, endTime, task } = this.props
+    let style = {}
+    let duration = ''
+    let tooltip = ''
+    if (startTime == null || endTime == null || task.startedAt == null || task.updatedAt == null) {
+      style = { width: 0 }
+    } else {
+      const totalSecs = endTime.unix() - startTime.unix()
+      const taskStartedAt = moment(task.startedAt)
+      const taskUpdatedAt = moment(task.updatedAt)
+      const taskDuration = moment.duration(taskUpdatedAt.diff(taskStartedAt))
+      const taskRelStartSecs = taskStartedAt.unix() - startTime.unix()
+      const taskRelEndSecs = taskUpdatedAt.unix() - startTime.unix()
+      const taskStartPct = 100.0 * (taskRelStartSecs / totalSecs)
+      const taskEndPct = 100.0 * (taskRelEndSecs / totalSecs)
+      const marginLeft = taskStartPct
+      const marginRight = 100.0 - taskEndPct
+      const width = taskEndPct - taskStartPct
+      style = {
+        marginLeft: `${marginLeft}%`,
+        width: `${width}%`,
+        marginRight: `${marginRight}%`
+      }
+      duration = taskDuration.format('d[d] h[h] mm[m] ss[s]')
+      tooltip = `${taskStartedAt.format()} - ${taskUpdatedAt.format()}`
+    }
+    return (
+      <tr>
+        <td style={{whiteSpace: 'nowrap'}}>{task.fullName}</td>
+        <td style={{width: '100%'}}>
+          <div className='progress' style={{marginBottom: 0}}>
+            <div ref={(em) => { this.progressBar = em }} data-toggle='tooltip' data-placement='bottom' title={tooltip}
+              className='progress-bar' role='progressbar' style={style}>{duration}</div>
+          </div>
+        </td>
+      </tr>
+    )
+  }
+}
+
+const TaskTimelineView = (props:{
+  tasks: Array<Task>;
+  startTime: ?Object;
+  endTime: ?Object;
+}) =>
+  <div className='table-responsive'>
+    <table className='table table-hover table-condensed'>
+      <thead>
+        <tr>
+          <th>Task</th>
+          <th>Execution</th>
+        </tr>
+      </thead>
+      <tbody>
+        { props.tasks.map(task =>
+          <TaskTimelineRow key={task.id} task={task} startTime={props.startTime} endTime={props.endTime} />) }
+      </tbody>
+    </table>
+  </div>
+
 class AttemptTasksView extends React.Component {
   ignoreLastFetch:boolean;
 
@@ -1265,6 +1342,64 @@ class AttemptTasksView extends React.Component {
       <div className='row'>
         <h2>Tasks</h2>
         <TaskListView tasks={this.state.tasks} />
+      </div>
+    )
+  }
+}
+
+function firstStartedAt (tasks: Array<Task>): ?Object {
+  return tasks
+    .filter(task => task.startedAt !== null)
+    .map(task => moment(task.startedAt))
+    .reduce((first, startedAt) => first === null || startedAt.isBefore(first) ? startedAt : first, null)
+}
+
+function lastUpdatedAt (tasks: Array<Task>): ?Object {
+  return tasks
+    .filter(task => task.updatedAt !== null)
+    .map(task => moment(task.updatedAt))
+    .reduce((last, updatedAt) => last === null || updatedAt.isAfter(last) ? updatedAt : last, null)
+}
+
+class AttemptTimelineView extends React.Component {
+  ignoreLastFetch:boolean;
+
+  props:{
+    attemptId: string;
+  };
+
+  state = {
+    tasks: []
+  };
+
+  componentDidMount () {
+    this.fetchTasks()
+  }
+
+  componentWillUnmount () {
+    this.ignoreLastFetch = true
+  }
+
+  componentDidUpdate (prevProps) {
+    if (_.isEqual(prevProps, this.props)) {
+      return
+    }
+    this.fetchTasks()
+  }
+
+  fetchTasks () {
+    model().fetchAttemptTasks(this.props.attemptId).then(({ tasks }) => {
+      if (!this.ignoreLastFetch) {
+        this.setState({tasks})
+      }
+    })
+  }
+
+  render () {
+    return (
+      <div className='row'>
+        <h2>Timeline</h2>
+        <TaskTimelineView tasks={this.state.tasks} startTime={firstStartedAt(this.state.tasks)} endTime={lastUpdatedAt(this.state.tasks)} />
       </div>
     )
   }
@@ -1594,6 +1729,7 @@ const AttemptPage = (props:{params: {attemptId: string}}) =>
   <div className='container-fluid'>
     <AttemptView attemptId={props.params.attemptId} />
     <AttemptTasksView attemptId={props.params.attemptId} />
+    <AttemptTimelineView attemptId={props.params.attemptId} />
     <AttemptLogsView attemptId={props.params.attemptId} />
   </div>
 
@@ -1661,6 +1797,12 @@ class SessionPage extends React.Component {
       : null
   }
 
+  timeline () {
+    return this.state.session && this.state.session.lastAttempt
+      ? <AttemptTimelineView attemptId={this.state.session.lastAttempt.id} />
+      : null
+  }
+
   logs () {
     return this.state.session && this.state.session.lastAttempt
       ? <AttemptLogsView attemptId={this.state.session.lastAttempt.id} />
@@ -1678,6 +1820,7 @@ class SessionPage extends React.Component {
       <div className='container-fluid'>
         {this.session()}
         {this.tasks()}
+        {this.timeline()}
         {this.logs()}
         {this.attempts()}
       </div>
