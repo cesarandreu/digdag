@@ -1,5 +1,7 @@
 package io.digdag.standards.operator.jdbc;
 
+import io.digdag.standards.operator.redshift.RedshiftConnection;
+
 import java.time.Duration;
 import java.util.List;
 import java.util.function.Consumer;

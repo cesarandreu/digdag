@@ -1,5 +1,11 @@
 package io.digdag.standards.operator.redshift;
 
+import com.amazonaws.auth.BasicAWSCredentials;
+import com.amazonaws.auth.policy.Policy;
+import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClient;
+import com.amazonaws.services.securitytoken.model.Credentials;
+import com.amazonaws.services.securitytoken.model.GetFederationTokenRequest;
+import com.amazonaws.services.securitytoken.model.GetFederationTokenResult;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Optional;
 import com.google.common.collect.ImmutableList;
@@ -49,13 +55,15 @@ public class RedshiftLoadOperatorFactory
         return new RedshiftLoadOperator(projectPath, request, templateEngine);
     }
 
+
     @VisibleForTesting
     static class RedshiftLoadOperator
         extends AbstractJdbcJobOperator<RedshiftConnectionConfig>
     {
         private final Logger logger = LoggerFactory.getLogger(getClass());
 
-        private RedshiftLoadOperator(Path projectPath, TaskRequest request, TemplateEngine templateEngine)
+        @VisibleForTesting
+        RedshiftLoadOperator(Path projectPath, TaskRequest request, TemplateEngine templateEngine)
         {
             super(projectPath, request, templateEngine);
         }
@@ -103,173 +111,104 @@ public class RedshiftLoadOperatorFactory
             return ctx.secrets().getSecrets("aws.redshift");
         }
 
-        static private String escapeParam(String param)
-        {
-            // TODO: Implement!
-            return param;
-        }
-
         @VisibleForTesting
-        static Map.Entry<String, List<Object>> createCopyStatement(Config params, SecretProvider secretProvider)
+        Credentials createSessionCredential(SecretProvider secretProvider)
         {
-            /*
-                redshift_load>: dest_table
-                source: s3://mybucket/data/listing/     // i.e. 'emr://j-SAMPLE2B500FC/myoutput/part-*'
-                format: JSON            // i.e. AVRO/CSV/DELIMITER/...
-                quote_char: "           // Optional (For CSV)
-                delimiter_char: '|'     // Optional (For DELIMITER)
-                fixedwidth_spec: 'colLabel1:colWidth1,colLabel:colWidth2, ...'      // Optional (For FIXEDWIDTH)
-                jsonpaths_file: s3://mybucket/jsonpaths.txt'    // Optional (For AVRO or JSON)
-                compression: LZOP       // Optional (BZIP2/GZIP/LZOP)
-                readratio: 50           // Optional
-                manifest: true          // Optional
-                removequotes: true      // Optional
-                emptyasnull: true       // Optional
-                blanksasnull: true      // Optional
-                maxerror: 5             // Optional
-                timeformat: 'YYYY-MM-DD HH:MI:SS'   // Optional
-                explicit_ids: true      // Optional
-                encrypted_data: true    // Optional (This requires "master_symmetric_key" secret)
-            */
-            String destTable = params.get("_command", String.class);
-            String sourceUri = params.get("source", String.class);
-
-            String format = params.get("format", String.class);
-            Optional<Boolean> manifest = params.getOptional("manifest", Boolean.class);
-            Optional<Character> quoteChar = params.getOptional("quote_char", Character.class);
-            Optional<Character> delimiterChar = params.getOptional("delimiter_char", Character.class);
-            Optional<String> jsonpathsFile = params.getOptional("jsonpaths_file", String.class);
-            Optional<String> compression = params.getOptional("compression", String.class);
-            Optional<Integer> readratio = params.getOptional("read_ratio", Integer.class);
-            Optional<Boolean> removeQuotes = params.getOptional("remove_quotes", Boolean.class);
-            Optional<Boolean> emptyAsNull = params.getOptional("empty_as_null", Boolean.class);
-            Optional<Boolean> blankAsNull = params.getOptional("blank_as_null", Boolean.class);
-            Optional<Integer> maxError = params.getOptional("max_error", Integer.class);
-            Optional<String> timeFormat = params.getOptional("time_format", String.class);
-            Optional<Boolean> explicitIds = params.getOptional("explicit_ids", Boolean.class);
-
             SecretProvider awsSecrets = secretProvider.getSecrets("aws");
             SecretProvider redshiftSecrets = awsSecrets.getSecrets("redshift");
             SecretProvider redshiftLoadSecrets = awsSecrets.getSecrets("redshift_load");
 
             String keyOfAccess = "access-key-id";
-            Optional<String> optAccessKey =
-                    Stream.of(
-                            redshiftLoadSecrets.getSecretOptional(keyOfAccess),
-                            redshiftSecrets.getSecretOptional(keyOfAccess),
-                            awsSecrets.getSecretOptional(keyOfAccess))
-                            .reduce(Optional.absent(), Optional::or);
-            if (!optAccessKey.isPresent()) {
-                throw new ConfigException(String.format("'%s' secrets doesn't exist", keyOfAccess));
-            }
-            String accessKey = optAccessKey.get();
+            String accessKeyId =
+                    redshiftLoadSecrets.getSecretOptional(keyOfAccess)
+                    .or(redshiftSecrets.getSecretOptional(keyOfAccess))
+                    .or(() -> awsSecrets.getSecret(keyOfAccess));
 
             String keyOfSecret = "secret-access-key";
-            Optional<String> optSecretKey =
-                    Stream.of(
-                            redshiftLoadSecrets.getSecretOptional(keyOfSecret),
-                            redshiftSecrets.getSecretOptional(keyOfSecret),
-                            awsSecrets.getSecretOptional(keyOfSecret))
-                            .reduce(Optional.absent(), Optional::or);
-            if (!optSecretKey.isPresent()) {
-                throw new ConfigException(String.format("'%s' secrets doesn't exist", keyOfSecret));
-            }
-            String secretKey = optSecretKey.get();
+            String secretAccessKey =
+                    redshiftLoadSecrets.getSecretOptional(keyOfSecret)
+                    .or(redshiftSecrets.getSecretOptional(keyOfSecret))
+                    .or(() -> awsSecrets.getSecret(keyOfSecret));
 
-            List<Object> paramsInSql = new ArrayList<>();
-            StringBuilder sb = new StringBuilder();
-            // main
-            sb.append(
-                    String.format("COPY %s FROM '%s'\n",
-                            escapeParam(destTable),
-                            escapeParam(sourceUri)));
-            // credentials
-            // TODO: Support ENCRYPTED
-            sb.append(
-                    String.format("CREDENTIALS '%s'\n",
-                            escapeParam(
-                                String.format("aws_access_key_id=%s;aws_secret_access_key=%s",
-                                        accessKey,
-                                        secretKey))));
-            // manifests
-            if (manifest.or(false)) {
-                sb.append("MANIFEST\n");
-            }
-            // format
-            sb.append(escapeParam(format));
-            switch (format.toUpperCase()) {
-                case "CSV":
-                    if (quoteChar.isPresent()) {
-                        sb.append(" QUOTE '?'");
-                        paramsInSql.add(quoteChar.get());
-                    }
-                    break;
-                case "DELIMITER":
-                    if (delimiterChar.isPresent()) {
-                        sb.append(" '?'");
-                        paramsInSql.add(delimiterChar.get());
-                    }
-                    break;
-                case "FIXEDWIDTH":
-                    String fixedwidthSpec = params.get("fixedwidth_spec", String.class);
-                    sb.append(" '?'");
-                    paramsInSql.add(fixedwidthSpec);
-                    break;
-                case "AVRO":
-                case "JSON":
-                    if (jsonpathsFile.isPresent()) {
-                        sb.append(" '?'");
-                        paramsInSql.add(jsonpathsFile.get());
-                    }
-                    break;
-            }
-            sb.append("\n");
+            // In real applications, the following code is part of your trusted code. It has
+            // your security credentials you use to obtain temporary security credentials.
+            AWSSecurityTokenServiceClient stsClient =
+                    new AWSSecurityTokenServiceClient(new BasicAWSCredentials(accessKeyId, secretAccessKey));
 
-            // compression
-            if (compression.isPresent()) {
-                sb.append("?\n");
-                paramsInSql.add(compression.get());
-            }
-            // readratio
-            if (readratio.isPresent()) {
-                sb.append("readratio ?\n");
-                paramsInSql.add(readratio.get());
-            }
-            // removeQuotes
-            if (removeQuotes.isPresent()) {
-                sb.append("removequotes\n");
-            }
-            // emptyAsNull
-            if (emptyAsNull.isPresent()) {
-                sb.append("emptyasnull\n");
-            }
-            // blankAsNull
-            if (blankAsNull.isPresent()) {
-                sb.append("blankasnull\n");
-            }
-            // maxError
-            if (maxError.isPresent()) {
-                sb.append("maxerror ?\n");
-                paramsInSql.add(maxError.get());
-            }
-            // timeFormat
-            if (timeFormat.isPresent()) {
-                sb.append("timeformat ?\n");
-                paramsInSql.add(timeFormat.get());
-            }
-            // explicitIds
-            if (explicitIds.isPresent()) {
-                sb.append("explicit_ids\n");
-            }
-            return new AbstractMap.SimpleImmutableEntry<>(sb.toString(), paramsInSql);
+            GetFederationTokenRequest federationTokenRequest = new GetFederationTokenRequest();
+            // TODO: This should be configurable?
+            federationTokenRequest.setDurationSeconds(3600 * 6);
+            federationTokenRequest.setName("Digdag Redshift Operator");
+
+            // Define the policy and add to the request.
+            Policy policy = new Policy();
+            // Define the policy here.
+            // Add the policy to the request.
+            federationTokenRequest.setPolicy(policy.toJson());
+
+            GetFederationTokenResult federationTokenResult =
+                    stsClient.getFederationToken(federationTokenRequest);
+
+            return federationTokenResult.getCredentials();
+        }
+
+        @VisibleForTesting
+        RedshiftConnection.CopyConfig createCopyConfig(Config config, Credentials sessionCredential)
+        {
+            return RedshiftConnection.CopyConfig.configure(
+                    copyConfig -> {
+                        copyConfig.accessKeyId = sessionCredential.getAccessKeyId();
+                        copyConfig.secretAccessKey = sessionCredential.getSecretAccessKey();
+                        copyConfig.sessionToken = sessionCredential.getSessionToken();
+
+                        copyConfig.tableName = config.get("table_name", String.class);
+                        copyConfig.columnList = config.getOptional("column_list", String.class);
+                        copyConfig.from = config.get("from", String.class);
+                        copyConfig.readratio = config.getOptional("readratio", Integer.class);
+                        copyConfig.manifest = config.getOptional("manifest", Boolean.class);
+                        copyConfig.encrypted = config.getOptional("encrypted", Boolean.class);
+                        copyConfig.region = config.getOptional("region", Boolean.class);
+
+                        copyConfig.csv = config.getOptional("csv", String.class);
+                        copyConfig.delimiter = config.getOptional("delimiter", String.class);
+                        copyConfig.fixedwidth = config.getOptional("fixedwidth", String.class);
+                        copyConfig.json = config.getOptional("json", String.class);
+                        copyConfig.avro = config.getOptional("avro", String.class);
+                        copyConfig.gzip = config.getOptional("gzip", Boolean.class);
+                        copyConfig.bzip2 = config.getOptional("bzip2", Boolean.class);
+                        copyConfig.lzop = config.getOptional("lzop", Boolean.class);
+
+                        copyConfig.acceptanydate = config.getOptional("acceptanydate", Boolean.class);
+                        copyConfig.acceptinvchars = config.getOptional("acceptinvchars", String.class);
+                        copyConfig.blanksasnull = config.getOptional("blanksasnull", Boolean.class);
+                        copyConfig.dateformat = config.getOptional("dateformat", String.class);
+                        copyConfig.emptyasnull = config.getOptional("emptyasnull", Boolean.class);
+                        copyConfig.encoding = config.getOptional("encoding", String.class);
+                        copyConfig.escape = config.getOptional("escape", Boolean.class);
+                        copyConfig.explicitIds = config.getOptional("explicit_ids", Boolean.class);
+                        copyConfig.fillrecord = config.getOptional("fillrecord", Boolean.class);
+                        copyConfig.ignoreblanklines = config.getOptional("ignoreblanklines", Boolean.class);
+                        copyConfig.ignoreheader = config.getOptional("ignoreheader", Integer.class);
+                        copyConfig.nullAs = config.getOptional("null_as", String.class);
+                        copyConfig.removequotes = config.getOptional("removequotes", Boolean.class);
+                        copyConfig.roundec = config.getOptional("roundec", Boolean.class);
+                        copyConfig.timeformat = config.getOptional("timeformat", String.class);
+                        copyConfig.trimblanks = config.getOptional("trimblanks", Boolean.class);
+                        copyConfig.truncatecolumns = config.getOptional("truncatecolumns", Boolean.class);
+                        copyConfig.comprows = config.getOptional("comprows", Integer.class);
+                        copyConfig.compupdate = config.getOptional("compupdate", String.class);
+                        copyConfig.maxerror = config.getOptional("maxerror", Integer.class);
+                        copyConfig.noload = config.getOptional("noload", Boolean.class);
+                        copyConfig.statupdate = config.getOptional("statupdate", String.class);
+                    });
         }
 
         @Override
         protected TaskResult run(TaskExecutionContext ctx, Config params, Config state, RedshiftConnectionConfig connectionConfig)
         {
-            Map.Entry<String, List<Object>> copyStatement = createCopyStatement(params, ctx.secrets());
-            String query = copyStatement.getKey();
-            List<Object> paramsInSql = copyStatement.getValue();
+            Credentials sessionCredential = createSessionCredential(ctx.secrets());
+
+            RedshiftConnection.CopyConfig copyConfig = createCopyConfig(params, sessionCredential);
 
             boolean strictTransaction = strictTransaction(params);
 
@@ -296,7 +235,11 @@ public class RedshiftLoadOperatorFactory
             }
             queryId = state.get(QUERY_ID, UUID.class);
 
-            try (JdbcConnection connection = connect(connectionConfig)) {
+            try (RedshiftConnection connection = connect(connectionConfig)) {
+                Map.Entry<String, List<Object>> result = connection.buildCopyStatement(copyConfig);
+                String query = result.getKey();
+                List<Object> paramsInSql = result.getValue();
+
                 Exception statementError = connection.validateStatement(query);
                 if (statementError != null) {
                     throw new ConfigException("Given query is invalid", statementError);
